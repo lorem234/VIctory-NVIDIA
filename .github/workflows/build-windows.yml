@@ -1,0 +1,40 @@
+name: Windows x64 release
+
+on:
+  push:
+    tags: ['windows-x64-*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: windows-2025
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+
+      - name: Build the standalone executable
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p victory
+
+      - name: Smoke-test the executable
+        run: ./target/x86_64-pc-windows-msvc/release/victory.exe --version
+
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          gh release create $env:RELEASE_TAG `
+            'target/x86_64-pc-windows-msvc/release/victory.exe' `
+            --verify-tag `
+            --title "VIctory NVIDIA for Windows x64 ($env:RELEASE_TAG)" `
+            --notes 'Download victory.exe and place it beside game_scarlett_master.exe in your own game dump. The source archive for this tag accompanies the executable.'
