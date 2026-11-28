@@ -1,5 +1,7 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
-//! (host slots 0-3); while none is connected, the keyboard drives one
+//! (host slots 0-3) and, in the slots XInput leaves empty, from HID
+//! ([`playstation`]: DualShock 4, DualSense, DualSense Edge); while none is
+//! connected, the keyboard drives one
 //! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A poll thread turns host state into readings (a new one per change)
 //! and runs device callbacks on connect and disconnect.
@@ -21,9 +23,20 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
-// PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy).
+// PS5 pads (DualSense, DualSense Edge) read straight from HID, USB or Bluetooth (from AnyXboxX's VIctory copy);
+// PS4 pads (DualShock 4) and rumble from FrancescoGelosoEterea/VIscosity (d8db7a0).
 #[cfg(any(windows, test))]
-mod dualsense;
+mod playstation;
+
+/// Stops the motors of the PlayStation pads read over HID, before the
+/// process ends (XInput pads stop by themselves when it does).
+pub(crate) fn stop_rumble() {
+    #[cfg(windows)]
+    if playstation::stop_rumble() {
+        // Their readers send it with their next report.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
 
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
@@ -67,8 +80,10 @@ const DEVICES: usize = PADS + 3;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button); README lists it.
-/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
+/// The keyboard's stand-in gamepad (key, button); README lists it.
+/// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C. The letters are
+/// where a US keyboard has them ([`pad_key`]): the same keys under the
+/// fingers on every layout (Z/Q/S/D on AZERTY).
 const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
@@ -85,6 +100,45 @@ const FALLBACK_BUTTONS: [(u8, u32); 14] = [
     (b'F', LEFT_STICK),
     (b'H', RIGHT_STICK),
 ];
+
+/// Where the stand-in pad's letters are on the keyboard: scan code (set 1)
+/// and the letter a US layout prints there.
+const LETTER_POSITIONS: [(u32, u8); 16] = [
+    (0x10, b'Q'),
+    (0x11, b'W'),
+    (0x12, b'E'),
+    (0x15, b'Y'),
+    (0x17, b'I'),
+    (0x1E, b'A'),
+    (0x1F, b'S'),
+    (0x20, b'D'),
+    (0x21, b'F'),
+    (0x23, b'H'),
+    (0x24, b'J'),
+    (0x25, b'K'),
+    (0x26, b'L'),
+    (0x2C, b'Z'),
+    (0x2D, b'X'),
+    (0x2E, b'C'),
+];
+
+/// The scan code of the stand-in pad's letter `vk` on a US layout.
+fn letter_position(vk: u8) -> Option<u32> {
+    LETTER_POSITIONS.iter().find(|(_, letter)| *letter == vk).map(|&(scan, _)| scan)
+}
+
+/// Which of the stand-in pad's keys `key` is. A letter key counts by where
+/// it is, not by what the layout prints on it: with the virtual key, an
+/// AZERTY keyboard had forward on the key marked W, in the bottom row. Other
+/// keys (Esc, Enter, the arrows) are the same key on every layout. 0: a
+/// letter key in none of the pad's places.
+fn pad_key(key: &KeyState) -> u8 {
+    match LETTER_POSITIONS.iter().find(|(scan, _)| *scan == key.scan_code) {
+        Some(&(_, letter)) => letter,
+        None if key.virtual_key.is_ascii_uppercase() => 0,
+        None => key.virtual_key,
+    }
+}
 
 /// A gamepad reading: triggers 0 to 1, sticks -1 to 1 (up positive).
 #[repr(C)]
@@ -123,6 +177,26 @@ struct MouseState {
 }
 const _: () = assert!(size_of::<MouseState>() == 40);
 
+/// Applies one captured mouse sample. While the F1 settings menu is open,
+/// motion deltas are discarded and button bits are cleared while keeping the
+/// virtual mouse connected at its last position (so closing the menu causes
+/// no camera jump and no disconnect/reconnect churn).
+fn apply_mouse_sample(
+    mouse: &mut MouseState,
+    (dx, dy): (i64, i64),
+    buttons: u32,
+    menu_open: bool,
+) -> MouseState {
+    if menu_open {
+        mouse.buttons = 0;
+    } else {
+        mouse.position_x += dx;
+        mouse.position_y += dy;
+        mouse.buttons = buttons;
+    }
+    *mouse
+}
+
 /// Host input, or a fake in tests.
 trait Source: Send {
     fn mouse(&mut self) -> Option<MouseState> { None }
@@ -136,7 +210,7 @@ trait Source: Send {
 
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
-        if keys.iter().any(|k| k.virtual_key == vk) {
+        if keys.iter().any(|k| pad_key(k) == vk) {
             1.0
         } else {
             0.0
@@ -1234,23 +1308,27 @@ mod host {
 
     impl Source for Host {
         fn mouse(&mut self) -> Option<MouseState> {
-            let (dx, dy) = crate::modules::lifecycle::captured_mouse_delta()?;
-            self.mouse.position_x += dx;
-            self.mouse.position_y += dy;
-            self.mouse.buttons = [0x01, 0x02, 0x04, 0x05, 0x06].into_iter().enumerate()
-                // SAFETY: virtual-key state query.
-                .fold(0, |bits, (i, vk)| bits | ((unsafe { GetAsyncKeyState(vk) } < 0) as u32) << i);
-            Some(self.mouse)
+            let delta = crate::modules::lifecycle::captured_mouse_delta()?;
+            let menu_open = victory_gpu::SETTINGS_MENU_OPEN.load(std::sync::atomic::Ordering::Relaxed);
+            let buttons = if menu_open {
+                0
+            } else {
+                [0x01, 0x02, 0x04, 0x05, 0x06].into_iter().enumerate()
+                    // SAFETY: virtual-key state query.
+                    .fold(0, |bits, (i, vk)| bits | ((unsafe { GetAsyncKeyState(vk) } < 0) as u32) << i)
+            };
+            Some(super::apply_mouse_sample(&mut self.mouse, delta, buttons, menu_open))
         }
         fn pad(&mut self, slot: usize) -> Option<PadState> {
-            // XInput first; HID PS5 pads take the slots XInput leaves free (`VICTORY_DUALSENSE`: 0 off, 1 both).
+            // XInput first; HID PlayStation pads (PS4 and PS5) take the slots XInput leaves free
+            // (`VICTORY_DUALSENSE`: 0 off, 1 both).
             if slot == 0 {
                 let xinput = std::array::from_fn(|slot| self.xinput(slot));
-                self.pads = super::dualsense::slots(
-                    super::dualsense::mode(),
+                self.pads = super::playstation::slots(
+                    super::playstation::mode(),
                     xinput,
                     &mut self.hid_slots,
-                    super::dualsense::pads,
+                    super::playstation::pads,
                 );
             }
             #[allow(unused_mut)]
@@ -1275,6 +1353,7 @@ mod host {
                 return Vec::new();
             }
             let mut down = scripted();
+            let scripted_keys = down.len();
             if focused() {
                 // Left/right modifier keys only, as devices report them; no
                 // mouse buttons (below 0x08).
@@ -1286,9 +1365,14 @@ mod host {
                 down.extend(held);
             }
             down.into_iter()
-                .map(|vk| KeyState {
-                    // SAFETY: plain query.
-                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                .enumerate()
+                .map(|(i, vk)| KeyState {
+                    // A scripted letter is the stand-in pad's key of that
+                    // name, where a US layout has it (`pad_key`).
+                    scan_code: Some(vk).filter(|_| i < scripted_keys).and_then(super::letter_position).unwrap_or_else(|| {
+                        // SAFETY: plain query.
+                        unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) }
+                    }),
                     virtual_key: vk,
                     // shortcut: no characters (code point 0);
                     // the title reads scan codes and virtual keys only.
@@ -1298,6 +1382,11 @@ mod host {
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
+            // A slot a HID pad has is one XInput left empty.
+            if let Some(id) = self.hid_slots[slot] {
+                super::playstation::rumble(id, low, high);
+                return;
+            }
             let speeds = XINPUT_VIBRATION {
                 wLeftMotorSpeed: low,
                 wRightMotorSpeed: high,
@@ -1528,7 +1617,7 @@ mod tests {
 
     fn key(virtual_key: u8) -> KeyState {
         KeyState {
-            scan_code: u32::from(virtual_key) + 0x100,
+            scan_code: letter_position(virtual_key).unwrap_or(u32::from(virtual_key) + 0x100),
             virtual_key,
             ..Default::default()
         }
@@ -1669,6 +1758,21 @@ mod tests {
     }
 
     #[test]
+    fn mouse_motion_and_buttons_are_suppressed_while_settings_menu_is_open() {
+        let mut mouse = MouseState::default();
+        let active = apply_mouse_sample(&mut mouse, (12, -5), 0b11, false);
+        assert_eq!(active, MouseState { position_x: 12, position_y: -5, buttons: 0b11, ..Default::default() });
+
+        // Opening the F1 menu drops motion deltas and clears buttons while keeping position.
+        let paused = apply_mouse_sample(&mut mouse, (40, 25), 0b01, true);
+        assert_eq!(paused, MouseState { position_x: 12, position_y: -5, buttons: 0, ..Default::default() });
+
+        // Closing the F1 menu resumes cleanly from the preserved position with no jump.
+        let resumed = apply_mouse_sample(&mut mouse, (3, 4), 0b10, false);
+        assert_eq!(resumed, MouseState { position_x: 15, position_y: -1, buttons: 0b10, ..Default::default() });
+    }
+
+    #[test]
     fn pads_connect_report_and_disconnect() {
         let (hub, host) = fake();
         let log = Log::default();
@@ -1763,6 +1867,23 @@ mod tests {
         release(r);
         // A keyboard reading is no gamepad reading.
         assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn the_stand_in_pad_reads_letters_by_their_place() {
+        // An AZERTY keyboard: the key above S is marked Z, the one left of S is Q.
+        let at = |scan_code, virtual_key| KeyState { scan_code, virtual_key, ..Default::default() };
+        let pad = fallback(&[at(0x11, b'Z'), at(0x1E, b'Q')]);
+        assert_eq!((pad.left_x, pad.left_y, pad.left_trigger), (-1.0, 1.0, 0.0));
+        // Its key marked W is in the bottom row, where the left trigger is; the one marked A is
+        // the left shoulder's.
+        let pad = fallback(&[at(0x2C, b'W'), at(0x10, b'A')]);
+        assert_eq!((pad.left_x, pad.left_y, pad.left_trigger), (0.0, 0.0, 1.0));
+        assert_eq!(pad.buttons, LEFT_SHOULDER);
+        // A letter in none of the pad's places presses nothing (Dvorak's S, right of L).
+        assert_eq!(fallback(&[at(0x27, b'S')]), PadState::default());
+        // Keys that are no letters are the same on every layout.
+        assert_eq!(fallback(&[at(0x1C, 0x0D)]).buttons, A);
     }
 
     #[test]
